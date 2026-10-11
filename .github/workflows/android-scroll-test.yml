@@ -1,0 +1,190 @@
+name: Android Scroll Test
+on:
+  push:
+    branches: [build/android-scroll-test]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout Ratspeak
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: Ratspeak
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Setup source qualification Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
+      - name: Setup Android bridge Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Check Android bridge sources before building
+        working-directory: Ratspeak
+        run: python3 scripts/ci/check-btleplug-integration.py
+
+      - name: Load reviewed source set
+        id: source
+        shell: bash
+        working-directory: Ratspeak
+        run: node scripts/release/source-integrity.mjs github-outputs >> "$GITHUB_OUTPUT"
+
+      - name: Checkout rsReticulum
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsReticulum
+          ref: ${{ steps.source.outputs.rsreticulum_ref }}
+          path: rsReticulum
+          fetch-depth: 0
+
+      - name: Checkout rsLXMF
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsLXMF
+          ref: ${{ steps.source.outputs.rslxmf_ref }}
+          path: rsLXMF
+          fetch-depth: 0
+
+      - name: Checkout rsLXST
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/rsLXST
+          ref: ${{ steps.source.outputs.rslxst_ref }}
+          path: rsLXST
+          fetch-depth: 0
+
+      - name: Checkout lrgp-rs
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ratspeak/lrgp-rs
+          ref: ${{ steps.source.outputs.lrgp_ref }}
+          path: lrgp-rs
+          fetch-depth: 0
+
+      - name: Verify reviewed source set
+        shell: bash
+        working-directory: Ratspeak
+        run: node scripts/release/source-integrity.mjs verify-release-source
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ steps.source.outputs.rust_toolchain }}
+          targets: aarch64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: ${{ steps.source.outputs.java }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          # Do not inherit the action's obsolete "tools platform-tools" default.
+          packages: platform-tools
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set +e +o pipefail
+          yes | sdkmanager "ndk;${{ steps.source.outputs.android_ndk }}"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -e -o pipefail
+          if [ "$sdkmanager_status" -ne 0 ]; then
+            exit "$sdkmanager_status"
+          fi
+
+      - name: Isolate pinned Android NDK
+        shell: bash
+        working-directory: Ratspeak
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
+        run: |
+          # Tauri 2.11.1 ignores an existing NDK_HOME and selects the last SDK/ndk
+          # entry. Keep this view alive until the job ends: generated JNI links,
+          # Gradle lint, and the optional AAB still depend on it after APK build.
+          node scripts/release/android-sdk-view.mjs create \
+            --sdk "$ANDROID_HOME" --ndk "$PINNED_ANDROID_NDK" \
+            --parent "$RUNNER_TEMP" --github-env "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          cache-bin: true
+          key: tauri-${{ steps.source.outputs.tauri_cli }}
+          workspaces: |
+            Ratspeak
+            Ratspeak/src-tauri
+          save-if: true
+
+      - name: Install Tauri CLI
+        shell: bash
+        working-directory: Ratspeak
+        run: bash scripts/release/install-tauri-cli.sh "${{ steps.source.outputs.tauri_cli }}"
+
+      - name: Build CSS
+        shell: bash
+        working-directory: Ratspeak
+        run: bash dashboard/build-css.sh
+
+      - name: Prepare side-by-side test application
+        working-directory: Ratspeak
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('src-tauri/gen/android/app/build.gradle.kts')
+          s = p.read_text()
+          marker = 'getByName("release") {'
+          assert s.count(marker) == 1
+          s = s.replace(marker, marker + '\n            applicationIdSuffix = ".scrolltest"\n            signingConfig = signingConfigs.getByName("debug")')
+          p.write_text(s)
+          p = Path('src-tauri/gen/android/app/src/main/res/values/strings.xml')
+          s = p.read_text().replace('>Ratspeak<', '>Ratspeak Scroll Test<')
+          p.write_text(s)
+          PYCODE
+          node scripts/dashboard/test_channels_touch_scroll.js
+          node scripts/dashboard/test_channels_composer.js
+
+      - name: Build standalone ARM64 APK
+        working-directory: Ratspeak/src-tauri
+        env:
+          PINNED_ANDROID_NDK: ${{ steps.source.outputs.android_ndk }}
+          RATSPEAK_DISPLAY_VERSION: 1.0.34-scroll-test
+        run: |
+          unset TAURI_CONFIG TAURI_DEV_HOST
+          cargo tauri android build --target aarch64 --apk --split-per-abi -- --locked
+          node ../scripts/release/android-sdk-view.mjs verify \
+            --view "$RATSPEAK_ANDROID_SDK_VIEW" --ndk "$PINNED_ANDROID_NDK"
+
+      - name: Validate and collect APK
+        working-directory: Ratspeak
+        run: |
+          bash scripts/release/assert-no-tauri-dev-url.sh src-tauri/gen/android/app/build/outputs
+          apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk
+          test -s "$apk"
+          python3 scripts/release/assert-android-jni-boundaries.py archive "$apk"
+          python3 scripts/release/assert-android-page-alignment.py "$apk"
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$build_tools/apksigner" verify --verbose "$apk"
+          "$build_tools/aapt" dump badging "$apk" > apk-badging.txt
+          grep -q "name='org.ratspeak.android.scrolltest'" apk-badging.txt
+          mkdir -p dist
+          cp "$apk" dist/Ratspeak-1.0.34-scroll-test-arm64.apk
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt
+          cp apk-badging.txt dist/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Ratspeak-Scroll-Test-ARM64
+          path: Ratspeak/dist/*
+          if-no-files-found: error
+          retention-days: 14
