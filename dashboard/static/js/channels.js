@@ -2895,7 +2895,8 @@ function _channelsBindTouchReplyAction(event, item, authorText) {
         duration: 500,
         moveCancelPx: 12,
         hapticStages: [{ at: 0.55, level: 'light' }],
-        preventDefaultOnStart: true,
+        // Keep touchstart passive so Android can scroll over message rows.
+        // The gesture recognizer cancels the hold when the finger moves.
         onFire: function() {
             if (typeof actionPopover !== 'function') {
                 _channelsInsertQuote(item, authorText);
